@@ -41,7 +41,6 @@ import org.apache.hadoop.io.retry.RetryPolicy;
 import org.apache.hadoop.io.retry.RetryPolicy.RetryAction;
 import org.apache.hadoop.ipc.AlignmentContext;
 import org.apache.hadoop.ipc.Client.ConnectionId;
-import org.apache.hadoop.ipc.ObserverRetryOnActiveException;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.ipc.RpcInvocationHandler;
@@ -465,16 +464,6 @@ public class ObserverReadProxyProvider<T>
               LOG.warn("Invocation returned interrupted exception on [{}];",
                   current.proxyInfo, e);
               throw e;
-            }
-            if (e instanceof RemoteException) {
-              RemoteException re = (RemoteException) e;
-              Exception unwrapped = re.unwrapRemoteException(
-                  ObserverRetryOnActiveException.class);
-              if (unwrapped instanceof ObserverRetryOnActiveException) {
-                LOG.debug("Encountered ObserverRetryOnActiveException from {}." +
-                    " Retry active namenode directly.", current.proxyInfo);
-                break;
-              }
             }
             RetryAction retryInfo = observerRetryPolicy.shouldRetry(e, 0, 0,
                 method.isAnnotationPresent(Idempotent.class)

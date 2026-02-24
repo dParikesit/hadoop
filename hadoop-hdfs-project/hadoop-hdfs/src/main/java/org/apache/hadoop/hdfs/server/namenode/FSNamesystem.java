@@ -121,7 +121,6 @@ import org.apache.hadoop.hdfs.protocol.SnapshotDiffReport;
 import org.apache.hadoop.hdfs.server.common.ECTopologyVerifier;
 import org.apache.hadoop.hdfs.server.namenode.metrics.ReplicatedBlocksMBean;
 import org.apache.hadoop.hdfs.server.protocol.SlowDiskReports;
-import org.apache.hadoop.ipc.ObserverRetryOnActiveException;
 import org.apache.hadoop.util.Time;
 import static org.apache.hadoop.util.Time.now;
 import static org.apache.hadoop.util.Time.monotonicNow;
@@ -2083,14 +2082,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
               } else {
                 throw se;
               }
-            }
-          }
-        } else if (haEnabled && haContext != null &&
-            haContext.getState().getServiceState() == OBSERVER) {
-          for (LocatedBlock b : res.blocks.getLocatedBlocks()) {
-            if (b.getLocations() == null || b.getLocations().length == 0) {
-              throw new ObserverRetryOnActiveException("Zero blocklocations "
-                  + "for " + srcArg);
             }
           }
         }
