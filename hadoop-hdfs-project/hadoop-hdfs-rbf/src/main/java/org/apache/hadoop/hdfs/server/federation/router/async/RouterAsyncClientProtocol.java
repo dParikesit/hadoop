@@ -20,13 +20,17 @@ package org.apache.hadoop.hdfs.server.federation.router.async;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
+import org.apache.hadoop.fs.BatchedRemoteIterator;
+import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedEntries;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.Options;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.ha.HAServiceProtocol;
 import org.apache.hadoop.hdfs.DFSUtil;
+import org.apache.hadoop.hdfs.inotify.EventBatchList;
 import org.apache.hadoop.hdfs.protocol.ClientProtocol;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.DirectoryListing;
@@ -34,14 +38,21 @@ import org.apache.hadoop.hdfs.protocol.EncryptionZone;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.LastBlockWithStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+import org.apache.hadoop.hdfs.protocol.OpenFileEntry;
+import org.apache.hadoop.hdfs.protocol.OpenFilesIterator;
 import org.apache.hadoop.hdfs.protocol.ReplicatedBlockStats;
 import org.apache.hadoop.hdfs.protocol.RollingUpgradeInfo;
 import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
+import org.apache.hadoop.hdfs.protocol.ZoneReencryptionStatus;
+import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
 import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamespaceInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.FileSubclusterResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.MountTableResolver;
+import org.apache.hadoop.hdfs.server.federation.resolver.PathLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.RouterResolveException;
 import org.apache.hadoop.hdfs.server.federation.router.NoLocationException;
@@ -73,8 +84,10 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -1063,6 +1076,23 @@ public class RouterAsyncClientProtocol extends RouterClientProtocol {
   }
 
   @Override
+  public EventBatchList getEditsFromTxid(long txid) throws IOException {
+    rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    RemoteMethod method = new RemoteMethod("getEditsFromTxid",
+        new Class<?>[] {long.class}, txid);
+    rpcServer.invokeAtAvailableNsAsync(method, EventBatchList.class);
+    return asyncReturn(EventBatchList.class);
+  }
+
+  @Override
+  public DataEncryptionKey getDataEncryptionKey() throws IOException {
+    rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    RemoteMethod method = new RemoteMethod("getDataEncryptionKey");
+    rpcServer.invokeAtAvailableNsAsync(method, DataEncryptionKey.class);
+    return asyncReturn(DataEncryptionKey.class);
+  }
+
+  @Override
   public void msync() throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ, true);
     // Only msync to nameservices with observer reads enabled.
@@ -1099,6 +1129,121 @@ public class RouterAsyncClientProtocol extends RouterClientProtocol {
           Boolean.TRUE);
     }
     return asyncReturn(boolean.class);
+  }
+
+  @Deprecated
+  @Override
+  public BatchedEntries<OpenFileEntry> listOpenFiles(long prevId)
+      throws IOException {
+    return listOpenFiles(prevId,
+        EnumSet.of(OpenFilesIterator.OpenFilesType.ALL_OPEN_FILES),
+        OpenFilesIterator.FILTER_PATH_DEFAULT);
+  }
+
+  @SuppressWarnings("unchecked")
+  @Override
+  public BatchedEntries<OpenFileEntry> listOpenFiles(long prevId,
+      EnumSet<OpenFilesIterator.OpenFilesType> openFilesTypes, String path)
+      throws IOException {
+    rpcServer.checkOperation(NameNode.OperationCategory.READ, true);
+    List<RemoteLocation> locations = rpcServer.getLocationsForPath(path, false, false);
+    RemoteMethod method = new RemoteMethod("listOpenFiles",
+        new Class<?>[] {long.class, EnumSet.class, String.class},
+        prevId, openFilesTypes, new RemoteParam());
+    rpcClient.invokeConcurrent(
+        locations, method, true, false, -1, BatchedEntries.class);
+
+    asyncApply(o -> {
+      Map<RemoteLocation, BatchedEntries> results = (Map<RemoteLocation, BatchedEntries>) o;
+
+      // Get the largest inodeIds for each namespace, and the smallest inodeId of them
+      // then ignore all entries above this id to keep a consistent prevId for the next
+      // listOpenFiles.
+      long minOfMax = Long.MAX_VALUE;
+      for (BatchedEntries nsEntries : results.values()) {
+        // Only need to care about namespaces that still have more files to report.
+        if (!nsEntries.hasMore()) {
+          continue;
+        }
+        long max = 0;
+        for (int i = 0; i < nsEntries.size(); i++) {
+          max = Math.max(max, ((OpenFileEntry) nsEntries.get(i)).getId());
+        }
+        minOfMax = Math.min(minOfMax, max);
+      }
+
+      // Concatenate all entries into one result, sorted by inodeId.
+      boolean hasMore = false;
+      Map<String, OpenFileEntry> routerEntries = new HashMap<>();
+      Map<String, RemoteLocation> resolvedPaths = new HashMap<>();
+      for (Map.Entry<RemoteLocation, BatchedEntries> entry : results.entrySet()) {
+        BatchedEntries nsEntries = entry.getValue();
+        hasMore |= nsEntries.hasMore();
+        for (int i = 0; i < nsEntries.size(); i++) {
+          OpenFileEntry ofe = (OpenFileEntry) nsEntries.get(i);
+          if (ofe.getId() > minOfMax) {
+            hasMore = true;
+            break;
+          }
+          RemoteLocation remoteLoc = entry.getKey();
+          String routerPath = ofe.getFilePath()
+              .replaceFirst(remoteLoc.getDest(), remoteLoc.getSrc());
+          OpenFileEntry newEntry = new OpenFileEntry(
+              ofe.getId(), routerPath, ofe.getClientName(), ofe.getClientMachine());
+          // An existing file already resolves to the same path. Resolve according to
+          // mount table and keep the best path.
+          if (resolvedPaths.containsKey(routerPath)) {
+            PathLocation pathLoc = subclusterResolver.getDestinationForPath(routerPath);
+            List<String> namespaces = pathLoc.getDestinations().stream()
+                .map(RemoteLocation::getNameserviceId)
+                .collect(Collectors.toList());
+            int existingIdx =
+                namespaces.indexOf(resolvedPaths.get(routerPath).getNameserviceId());
+            int currentIdx = namespaces.indexOf(remoteLoc.getNameserviceId());
+            if (currentIdx < existingIdx && currentIdx != -1) {
+              routerEntries.put(routerPath, newEntry);
+              resolvedPaths.put(routerPath, remoteLoc);
+            }
+          } else {
+            routerEntries.put(routerPath, newEntry);
+            resolvedPaths.put(routerPath, remoteLoc);
+          }
+        }
+      }
+
+      List<OpenFileEntry> entryList = new ArrayList<>(routerEntries.values());
+      entryList.sort(Comparator.comparingLong(OpenFileEntry::getId));
+      return new BatchedRemoteIterator.BatchedListEntries<>(entryList, hasMore);
+    });
+    return asyncReturn(BatchedEntries.class);
+  }
+
+  @Override
+  public void reportBadBlocks(LocatedBlock[] blocks) throws IOException {
+    rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+
+    // Block pool to list of bad blocks.
+    final Map<String, List<LocatedBlock>> blockLocations = new HashMap<>();
+    for (LocatedBlock block : blocks) {
+      String bpId = block.getBlock().getBlockPoolId();
+      List<LocatedBlock> bpBlocks = blockLocations.get(bpId);
+      if (bpBlocks == null) {
+        bpBlocks = new LinkedList<>();
+        blockLocations.put(bpId, bpBlocks);
+      }
+      bpBlocks.add(block);
+    }
+
+    // Invoke each block pool.
+    for (Map.Entry<String, List<LocatedBlock>> entry : blockLocations.entrySet()) {
+      String bpId = entry.getKey();
+      List<LocatedBlock> bpBlocks = entry.getValue();
+      LocatedBlock[] bpBlocksArray = bpBlocks.toArray(new LocatedBlock[0]);
+      RemoteMethod method = new RemoteMethod("reportBadBlocks",
+          new Class<?>[] {LocatedBlock[].class}, new Object[] {bpBlocksArray});
+      rpcClient.invokeSingleBlockPool(bpId, method);
+    }
+    asyncComplete(null);
   }
 
   /**
@@ -1140,6 +1285,38 @@ public class RouterAsyncClientProtocol extends RouterClientProtocol {
   }
 
   @Override
+  public BatchedEntries<EncryptionZone> listEncryptionZones(long prevId)
+      throws IOException {
+    rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    RemoteMethod method = new RemoteMethod("listEncryptionZones",
+        new Class<?>[] {long.class}, prevId);
+    rpcServer.invokeAtAvailableNsAsync(method, BatchedEntries.class);
+    return asyncReturn(BatchedEntries.class);
+  }
+
+  @Override
+  public void reencryptEncryptionZone(String zone,
+      HdfsConstants.ReencryptAction action) throws IOException {
+    rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final List<RemoteLocation> locations =
+        rpcServer.getLocationsForPath(zone, false, false);
+    RemoteMethod method = new RemoteMethod("reencryptEncryptionZone",
+        new Class<?>[] {String.class, HdfsConstants.ReencryptAction.class},
+        new RemoteParam(), action);
+    rpcClient.invokeSequential(locations, method, null, null);
+  }
+
+  @Override
+  public BatchedEntries<ZoneReencryptionStatus> listReencryptionStatus(long prevId)
+      throws IOException {
+    rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    RemoteMethod method = new RemoteMethod("listReencryptionStatus",
+        new Class<?>[] {long.class}, prevId);
+    rpcServer.invokeAtAvailableNsAsync(method, BatchedEntries.class);
+    return asyncReturn(BatchedEntries.class);
+  }
+
+  @Override
   public Path getEnclosingRoot(String src) throws IOException {
     final Path[] mountPath = new Path[1];
     if (defaultNameServiceEnabled) {
@@ -1167,6 +1344,12 @@ public class RouterAsyncClientProtocol extends RouterClientProtocol {
       }
     });
     return asyncReturn(Path.class);
+  }
+
+  @Override
+  public HAServiceProtocol.HAServiceState getHAServiceState() {
+    asyncComplete(super.getHAServiceState());
+    return asyncReturn(HAServiceProtocol.HAServiceState.class);
   }
 
   @Override
