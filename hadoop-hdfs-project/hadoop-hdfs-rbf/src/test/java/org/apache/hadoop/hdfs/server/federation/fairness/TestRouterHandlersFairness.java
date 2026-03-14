@@ -178,8 +178,8 @@ public class TestRouterHandlersFairness {
   }
 
   /**
-   * Ensure that the semaphore is not acquired,
-   * when invokeSequential or invokeConcurrent throws any exception.
+   * Ensure that permits are not leaked when invokeSequential, invokeSingle,
+   * or invokeConcurrent throws any exception.
    */
   @MethodSource("primes")
   @ParameterizedTest
@@ -215,6 +215,7 @@ public class TestRouterHandlersFairness {
     // Use renewLease test invokeConcurrent.
     Collection<RemoteLocation> locations = new ArrayList<>();
     locations.add(new RemoteLocation("ns0", "/", "/"));
+    locations.add(new RemoteLocation("ns1", "/", "/"));
     RemoteMethod renewLease = new RemoteMethod(
         "renewLease",
         new Class[]{java.lang.String.class, java.util.List.class},
@@ -222,12 +223,22 @@ public class TestRouterHandlersFairness {
     availablePermits =
         rpcClient.getRouterRpcFairnessPolicyController().getAvailablePermits("ns0");
     LambdaTestUtils.intercept(IOException.class,  () -> {
+      LOG.info("Use renewLease test namespace-based invokeSingle.");
+      rpcClient.invokeSingle("ns0", renewLease);
+    });
+    // Ensure that the namespace semaphore is released.
+    assertEquals(availablePermits,
+        rpcClient.getRouterRpcFairnessPolicyController().getAvailablePermits("ns0"));
+
+    availablePermits =
+        rpcClient.getRouterRpcFairnessPolicyController().getAvailablePermits(CONCURRENT_NS);
+    LambdaTestUtils.intercept(IOException.class,  () -> {
       LOG.info("Use renewLease test invokeConcurrent.");
       rpcClient.invokeConcurrent(locations, renewLease);
     });
-    // Ensure that the semaphore is not acquired.
+    // Ensure that the concurrent semaphore is released.
     assertEquals(availablePermits,
-        rpcClient.getRouterRpcFairnessPolicyController().getAvailablePermits("ns0"));
+        rpcClient.getRouterRpcFairnessPolicyController().getAvailablePermits(CONCURRENT_NS));
   }
 
   /**
